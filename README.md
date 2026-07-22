@@ -1,6 +1,6 @@
 # Pi A2A Agent Mesh — Setup & Operations
 
-Production-grade agent-to-agent communication mesh built on **pi coding agent** (v0.81.1+) with long-term memory, web access, guard rails, scheduling, and dual-model switching.
+Production-grade agent-to-agent communication mesh built on **pi coding agent** (v0.81.1+) and the **[fasta2a](https://pypi.org/project/fasta2a/)** Python library (A2A protocol v0.3.0). Includes long-term memory, web access, guard rails, scheduling, and dual-model switching.
 
 ## Architecture Overview
 
@@ -14,8 +14,8 @@ Production-grade agent-to-agent communication mesh built on **pi coding agent** 
 │   └────┬────┘                      └────┬────┘          │
 │        │                                │                │
 │   ┌────┴────┐                      ┌────┴────┐          │
-│   │ cheap   │                      │ supabase│          │
-│   │ model   │                      │ + n8n   │          │
+│   │ cheap   │                      │ custom  │          │
+│   │ model   │                      │ backend │          │
 │   └─────────┘                      └─────────┘          │
 │                                                          │
 │   Message Flow: Send → Poll → Verify (no hallucination)  │
@@ -24,35 +24,47 @@ Production-grade agent-to-agent communication mesh built on **pi coding agent** 
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Dual-Model Intelligence
+### Why Two Pi Instances? (Dual-Model Pool)
 
-Every agent runs **two pi processes** simultaneously:
+A single pi process is locked to one model at startup. Instead of restarting the process to switch models (slow, loses state), the server runs **two processes in parallel**:
 
-| Model | Purpose | Tools | Cost |
-|-------|---------|-------|------|
-| **Cheap** (gemma-3-12b, etc.) | Chat, handshakes, coordination | None | ~$0.10/M |
-| **Capable** (deepseek-v4, claude, etc.) | Code, deploy, debug, real work | Full (read/bash/write/edit) | Varies |
+| Process | Model | Tools | Cost | Purpose |
+|---------|-------|-------|------|---------|
+| **Cheap** | gemma-3-12b (or similar) | None (`--no-builtin-tools`) | ~$0.10/M tokens | Chat, handshakes, coordination, simple Q&A |
+| **Capable** | deepseek-v4-pro (or similar) | Full (read/bash/write/edit) | Varies | Code generation, deployment, debugging, real work |
 
-**Automatic switching**: The server detects task complexity by keyword, length, and intent. Simple pings never touch the expensive model. Complex tasks automatically route to the capable one.
+**Automatic switching**: The server detects task complexity before dispatching. Simple pings never touch the expensive model. Complex tasks automatically route to the capable one. Both processes are always warm — no cold-start delay.
+
+**If you don't need dual-model**: Set `A2A_CAPABLE_MODEL=$A2A_MODEL` in `.env` and the server will only start one process.
 
 ### Verified Message Exchange (No Hallucination)
 
-Every A2A message follows a strict **send → poll → verify** cycle:
+Every A2A message follows a **send → poll → verify** cycle:
 
 ```
 Sender                    Receiver
   │                          │
-  │── POST message/send ───►│  (returns task_id immediately)
+  │── POST message/send ───►│  (returns { "result": { "id": "task-uuid" } })
   │                          │  (pi processes in background)
   │                          │  (audit log: task_started)
   │                          │
-  │── POST tasks/get ◄──────│  (poll every 2s)
-  │   (task_id)              │
+  │── POST tasks/get ◄──────│  (poll: state = "working")
+  │   {"id": "task-uuid"}    │
   │                          │
-  │── POST tasks/get ◄──────│  state: "completed"
-  │   (task_id)              │  artifacts[0].parts[0].text = result
+  │── POST tasks/get ◄──────│  (poll: state = "completed")
+  │   {"id": "task-uuid"}    │  artifacts[0].parts[0].text = result
   │                          │  (audit log: task_completed + duration + length)
 ```
+
+**Poll details**: The client polls `tasks/get` every 2 seconds, up to 60 times (120s max timeout). Most cheap-model tasks complete in 1-5s (1-3 polls). Capable-model tasks with DeepSeek thinking can take 30-60s (15-30 polls).
+
+**Why polling instead of streaming?** The standard A2A protocol supports both polling (`tasks/get`) and SSE streaming (`message/stream`). This implementation uses polling because:
+- Simpler to debug and audit (every state transition is logged)
+- Works through any HTTP proxy or firewall
+- Task results are immutable artifacts, not partial stream chunks
+- The `a2a-send.sh` CLI tool can work with plain `curl`
+
+Peers that support streaming can use the `message/stream` method instead — this server is compatible with standard A2A clients.
 
 **Key properties:**
 - **Task IDs are UUIDs** — every message traceable end-to-end
@@ -60,6 +72,37 @@ Sender                    Receiver
 - **State machine**: `pending → working → completed/failed/canceled`
 - **No "trust me bro"** — responses are verified artifacts, not model hallucinations
 - **HMAC signatures** — cryptographic proof of sender identity
+
+## A2A Protocol & fasta2a
+
+This server is built on **[fasta2a](https://pypi.org/project/fasta2a/)** (Python), which implements the [Google A2A protocol](https://a2a-protocol.org/) (Agent-to-Agent, v0.3.0).
+
+### What fasta2a Provides
+
+| Component | Role |
+|-----------|------|
+| `FastA2A` app | HTTP server with agent card, task endpoints, lifespan |
+| `Broker` + `Storage` | Task queue and state persistence (InMemory by default) |
+| `Worker` | Task execution loop (we subclass this for pi integration) |
+| `Skill` | Declarative agent capabilities in the agent card |
+| `Message`, `Artifact`, `TextPart` | A2A data model types |
+
+### How This Server Extends Standard A2A
+
+| Feature | Standard A2A | Our Implementation |
+|---------|-------------|-------------------|
+| Transport | JSON-RPC 2.0 over HTTP | Same — fully compatible |
+| Task lifecycle | `tasks/get`, `tasks/cancel` | Same + **circuit breaker** (3 failures → 60s cooldown) |
+| Auth | Not specified (bring your own) | **5-layer**: IP whitelist, Bearer token, rate limiter, guard rails, audit |
+| Model selection | Not specified | **Dual-model pool** with automatic complexity detection |
+| Peer discovery | Agent card polling | Same + **auto-discovery** of unknown callers |
+| Routing | Not specified | **Keyword-based routing** to peer agents |
+| Signing | Not specified | **HMAC-SHA256** request signing for cryptographic identity verification |
+| Fast path | Not specified | **Instant responses** for ping/status/handshake (0ms, 0 tokens) |
+
+### Why Not Pure A2A?
+
+Standard A2A is a protocol spec — it defines message formats and endpoints but leaves auth, routing, model selection, security, and reliability as implementation details. This server fills those gaps with production-hardened defaults while remaining **fully compatible** with any standard A2A client.
 
 ## Security: 5-Layer Defense
 
@@ -258,7 +301,7 @@ Every interaction is logged to `audit.log` (JSONL format):
   "timestamp": "2026-07-22T22:38:00.465821+00:00",
   "event": "task_completed",
   "task_id": "39ce0539-8c47-4730-9ab3-a36e0b957b40",
-  "routed_to": "pisti (local)",
+  "routed_to": "agent-name (local)",
   "duration_ms": 3293.78,
   "response_length": 199
 }
@@ -327,7 +370,7 @@ The complexity detector checks (in order):
 1. **Fast path**: Exact matches for "ping", "status", "handshake" → instant response (0ms, 0 tokens)
 2. **Short messages** (≤30 chars): "hello", "hi", "hey", "test" → instant response
 3. **Length > 300 chars** → capable model
-4. **Keywords**: deploy, fix, debug, create, build, docker, review, analyze, error, broken, nginx, portfolio, etc. → capable model
+4. **Keywords**: deploy, fix, debug, create, build, docker, review, analyze, error, broken, etc. → capable model
 5. **Action verbs** with length > 80: "can you", "please help", "investigate" → capable model
 6. **Everything else** → cheap model
 
