@@ -609,7 +609,7 @@ class TaskRouter:
                 task_id = result.get("result", {}).get("id")
 
                 if task_id:
-                    delays = [1, 2, 4, 8, 16]
+                    delays = [4, 4, 8, 8, 16, 16]
                     for delay in delays:
                         await asyncio.sleep(delay)
                         poll_resp = await client.post(
@@ -633,7 +633,7 @@ class TaskRouter:
                                     "agent_url": agent_url, "task_id": task_id,
                                     "error": f"Task {state}"}
                     return {"local": False, "agent": agent_name,
-                            "task_id": task_id, "error": "timeout after 31s (exponential backoff)"}
+                            "task_id": task_id, "error": "timeout after 56s (relaxed backoff)"}
                 else:
                     return {"local": False, "agent": agent_name,
                             "error": "No task ID returned"}

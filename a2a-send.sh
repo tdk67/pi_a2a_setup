@@ -38,8 +38,8 @@ TASK_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)
 echo "  Task ID: $TASK_ID"
 echo "  Waiting for response..."
 
-# Step 2: Poll with exponential backoff (1s, 2s, 4s, 8s, 16s = max 31s)
-DELAYS="1 2 4 8 16"
+# Step 2: Poll with relaxed backoff (4,4,8,8,16,16 = max 56s)
+DELAYS="4 4 8 8 16 16"
 for delay in $DELAYS; do
   sleep $delay
   TASK=$(curl -s -X POST "$AGENT_URL/" \
@@ -77,5 +77,5 @@ for a in task['result'].get('artifacts',[]):
 done
 
 echo ""
-echo "✗ Timeout after 31s (exponential backoff)"
+echo "✗ Timeout after 56s (relaxed backoff)"
 exit 1

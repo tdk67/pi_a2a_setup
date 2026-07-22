@@ -56,7 +56,7 @@ Sender                    Receiver
   │                          │  (audit log: task_completed + duration + length)
 ```
 
-**Poll details**: Uses **exponential backoff** — 1s, 2s, 4s, 8s, 16s (max 5 polls = 31s total). Most cheap-model tasks complete in 1-3s (1-2 polls). Capable-model tasks complete in 15-45s (3-4 polls). If no result after 31s, returns a timeout error.
+**Poll details**: Uses **relaxed exponential backoff** — 4s, 4s, 8s, 8s, 16s, 16s (max 6 polls = 56s total). Each step fires twice before doubling, keeping request rates low. Most cheap-model tasks complete by the 2nd poll (8s). Capable-model tasks complete by the 4th-5th poll (24-40s). If no result after 56s, returns a timeout error.
 
 **Why polling instead of streaming?** The standard A2A protocol supports both polling (`tasks/get`) and SSE streaming (`message/stream`). This implementation uses polling because:
 - Simpler to debug and audit (every state transition is logged)
