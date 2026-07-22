@@ -1,0 +1,9 @@
+{
+  "PEER_IP_HERE": {
+    "name": "PeerAgentName",
+    "description": "What this agent does",
+    "url": "http://PEER_IP:PORT",
+    "skills": ["skill1", "skill2"],
+    "last_seen": null
+  }
+}

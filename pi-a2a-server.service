@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi A2A Agent Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/pi-a2a-server
+EnvironmentFile=/etc/pi-a2a-server/.env
+ExecStart=/usr/bin/python3 /etc/pi-a2a-server/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

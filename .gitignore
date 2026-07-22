@@ -1,0 +1,19 @@
+# Pi A2A Setup
+*.log
+audit.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Agent identity (do not commit!)
+.env
+peers.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
