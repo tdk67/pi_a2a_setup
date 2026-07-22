@@ -56,7 +56,7 @@ Sender                    Receiver
   │                          │  (audit log: task_completed + duration + length)
 ```
 
-**Poll details**: The client polls `tasks/get` every 2 seconds, up to 60 times (120s max timeout). Most cheap-model tasks complete in 1-5s (1-3 polls). Capable-model tasks with DeepSeek thinking can take 30-60s (15-30 polls).
+**Poll details**: Uses **exponential backoff** — 1s, 2s, 4s, 8s, 16s (max 5 polls = 31s total). Most cheap-model tasks complete in 1-3s (1-2 polls). Capable-model tasks complete in 15-45s (3-4 polls). If no result after 31s, returns a timeout error.
 
 **Why polling instead of streaming?** The standard A2A protocol supports both polling (`tasks/get`) and SSE streaming (`message/stream`). This implementation uses polling because:
 - Simpler to debug and audit (every state transition is logged)
