@@ -1,7 +1,5 @@
 """
-Live Demo Proxy — sits between the React UI and the A2A agent mesh.
-Strips all secrets, enforces message whitelist, masks IPs.
-Supports real-time polling: frontend polls /api/poll every 2s.
+Live Demo Proxy v2 — independent polling, frontend just reads state.
 """
 
 import asyncio
@@ -33,8 +31,7 @@ if os.environ.get("SISI_IP"): IP_MASK[os.environ["SISI_IP"]] = "Agent B (Databas
 if os.environ.get("NORI_IP"): IP_MASK[os.environ["NORI_IP"]] = "Agent C (Automation)"
 
 def mask_ip(text: str) -> str:
-    for ip, label in IP_MASK.items():
-        text = text.replace(ip, label)
+    for ip, label in IP_MASK.items(): text = text.replace(ip, label)
     return text
 
 def mask_token(text: str) -> str:
@@ -42,10 +39,8 @@ def mask_token(text: str) -> str:
     return text
 
 def scrub(text: str) -> str:
-    text = mask_ip(text)
-    text = mask_token(text)
-    text = re.sub(r'\b[a-f0-9]{64}\b', '[REDACTED]', text)
-    return text
+    text = mask_ip(text); text = mask_token(text)
+    return re.sub(r'\b[a-f0-9]{64}\b', '[REDACTED]', text)
 
 # ── Message whitelist ──
 MESSAGE_WHITELIST: dict[str, str] = {
@@ -56,20 +51,20 @@ MESSAGE_WHITELIST: dict[str, str] = {
     "offtopic": "What's the color of the sky?",
 }
 
-# ── Rate limiter ──
 _rate_store: dict[str, float] = {}
 RATE_LIMIT_S = 10
 
 def check_rate(ip: str) -> bool:
     now = time.time()
-    if now - _rate_store.get(ip, 0) < RATE_LIMIT_S:
-        return False
-    _rate_store[ip] = now
-    return True
+    if now - _rate_store.get(ip, 0) < RATE_LIMIT_S: return False
+    _rate_store[ip] = now; return True
 
-# ── In-flight tasks store ──
-_pending_tasks: dict[str, dict] = {}  # task_uuid → {url, poll_index, t_start, headers, a2a_task_id}
+TARGET_URLS = {"pisti": PISTI_URL, "sisi": SISI_URL, "nori": NORI_URL}
+TARGET_LABELS = {"pisti": "Pisti (Coordinator)", "sisi": "Sisi (Database)", "nori": "Nori (Automation)"}
+DELAYS = [4, 4, 8, 8, 16, 16]
 
+# ── Task state store (proxy manages polling, frontend reads) ──
+_task_states: dict[str, dict] = {}
 
 def get_message_text(msg_id: str) -> str | None:
     if msg_id == "edit":
@@ -85,38 +80,132 @@ def get_message_text(msg_id: str) -> str | None:
     return MESSAGE_WHITELIST.get(msg_id)
 
 
+async def _handle_direct(msg_id: str, agent_label: str) -> JSONResponse:
+    """Handle data lookups directly in the proxy — instant, no A2A needed."""
+    task_uuid = uuid.uuid4().hex
+
+    if msg_id == "roster":
+        agents = await get_cluster_agents()
+        lines = ["## Agent Roster\n"]
+        for a in agents:
+            lines.append(f"**{a['name']}** ({a['masked_ip']}) — v{a['version']}, {a['skills']} skills, {a['status']}")
+        response = "\n".join(lines)
+    elif msg_id == "portfolio":
+        try:
+            data = json.load(open("/root/taskmind-portfolio/data/projects.json"))
+            recent = sorted(data, key=lambda x: x.get("date", ""), reverse=True)[:3]
+            lines = ["## 3 Most Recent Portfolio Items\n"]
+            for item in recent:
+                lines.append(f"**{item['title']}** — {item['date']}: {item['description']}")
+            response = "\n".join(lines)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    elif msg_id == "audit":
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tail", "-10", "/root/pi-a2a-server/audit.log",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await proc.communicate()
+            lines = ["## Recent Audit Log (masked)\n"]
+            for line in stdout.decode().strip().split("\n"):
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        ts = entry.get("timestamp", "")[:19]
+                        evt = entry.get("event", "?")
+                        routed = entry.get("routed_to", "?")
+                        dur = entry.get("duration_ms", "?")
+                        lines.append(f"`{ts}` {evt} → {routed} ({dur}ms)")
+                    except Exception:
+                        lines.append(mask_ip(mask_token(line)))
+            response = "\n".join(lines)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    else:
+        return JSONResponse({"error": f"Unknown direct message: {msg_id}"}, status_code=400)
+
+    _task_states[task_uuid] = {
+        "state": "completed", "response": response,
+        "duration_ms": 0, "total_polls": 0, "ts": time.time(),
+    }
+    return JSONResponse({"task_uuid": task_uuid, "agent_label": agent_label, "message_id": msg_id})
+
 async def get_cluster_agents() -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{PISTI_URL}/cluster")
             if resp.status_code != 200: return []
             data = resp.json()
-            agents = [{
-                "id": "pisti", "name": "Pisti", "version": data.get("version", "3.0.0"),
-                "skills": 5, "status": "online", "masked_ip": "Agent A (Coordinator)",
-            }]
+            agents = [{"id": "pisti", "name": "Pisti", "version": data.get("version", "3.0.0"),
+                       "skills": 5, "status": "online", "masked_ip": "Agent A (Coordinator)"}]
             for peer in data.get("peers", []):
-                peer_ip = peer.get("ip", "")
-                agents.append({
-                    "id": peer.get("name", "").lower(),
-                    "name": peer.get("name", "Unknown"),
-                    "version": "1.0.0",
-                    "skills": len(peer.get("skills", [])),
-                    "status": "online" if peer.get("status") == "online" else "offline",
-                    "masked_ip": IP_MASK.get(peer_ip, f"Agent ({peer_ip[:8]}...)"),
-                })
+                agents.append({"id": peer.get("name", "").lower(), "name": peer.get("name", "Unknown"),
+                               "version": "1.0.0", "skills": len(peer.get("skills", [])),
+                               "status": "online" if peer.get("status") == "online" else "offline",
+                               "masked_ip": IP_MASK.get(peer.get("ip", ""), f"Agent ({peer.get('ip','')[:8]}...)")})
             return agents
-    except Exception:
-        return []
+    except Exception: return []
+
+
+async def _background_poll(task_uuid: str, url: str, a2a_task_id: str, headers: dict, t_start: float):
+    """Background task: polls the A2A agent on the delay schedule, updates _task_states."""
+    for i, delay in enumerate(DELAYS):
+        await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=30, headers=headers) as client:
+                poll_resp = await client.post(f"{url}/", json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
+                    "params": {"id": a2a_task_id},
+                })
+                if poll_resp.status_code != 200:
+                    _task_states[task_uuid] = {
+                        "state": "error", "error": f"HTTP {poll_resp.status_code}",
+                        "poll": i+1, "ts": time.time(),
+                    }
+                    return
+                poll_data = poll_resp.json()
+                state = poll_data.get("result", {}).get("status", {}).get("state", "unknown")
+
+                if state == "completed":
+                    response_text = ""
+                    for a in poll_data.get("result", {}).get("artifacts", []):
+                        for p in a.get("parts", []):
+                            if p.get("kind") == "text": response_text += p.get("text", "")
+                    if not response_text:
+                        for m in poll_data.get("result", {}).get("history", []):
+                            if m.get("role") == "agent":
+                                for p in m.get("parts", []):
+                                    if p.get("kind") == "text": response_text += p.get("text", "")
+                    _task_states[task_uuid] = {
+                        "state": "completed",
+                        "response": scrub(response_text) if response_text else "(empty — task produced no text output)",
+                        "duration_ms": (time.time() - t_start) * 1000,
+                        "total_polls": i + 1,
+                        "ts": time.time(),
+                    }
+                    return
+                elif state in ("failed", "canceled"):
+                    _task_states[task_uuid] = {
+                        "state": state, "error": f"Task {state}",
+                        "poll": i+1, "ts": time.time(),
+                    }
+                    return
+                else:
+                    _task_states[task_uuid] = {
+                        "state": state, "poll": i+1, "ts": time.time(),
+                    }
+        except Exception as e:
+            _task_states[task_uuid] = {"state": "error", "error": str(e), "poll": i+1, "ts": time.time()}
+            return
+
+    # All delays exhausted
+    if task_uuid in _task_states and _task_states[task_uuid].get("state") not in ("completed", "failed", "canceled", "error"):
+        _task_states[task_uuid] = {"state": "timeout", "error": "Timeout after 56s", "ts": time.time()}
 
 
 # ── App ──
 app = Starlette()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-TARGET_URLS = {"pisti": PISTI_URL, "sisi": SISI_URL, "nori": NORI_URL}
-TARGET_LABELS = {"pisti": "Pisti (Coordinator)", "sisi": "Sisi (Database)", "nori": "Nori (Automation)"}
-DELAYS = [4, 4, 8, 8, 16, 16]
 
 
 async def api_agents(request: Request):
@@ -124,7 +213,6 @@ async def api_agents(request: Request):
 
 
 async def api_send(request: Request):
-    """Send a message — returns task_uuid immediately. Frontend then polls /api/poll."""
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate(client_ip):
         return JSONResponse({"error": "Rate limit — 10s between requests"}, status_code=429)
@@ -136,7 +224,6 @@ async def api_send(request: Request):
     target = body.get("target", "pisti")
     agent_url = TARGET_URLS.get(target, PISTI_URL)
     agent_label = TARGET_LABELS.get(target, target)
-
     if not agent_url:
         return JSONResponse({"error": f"Agent '{target}' not configured"}, status_code=400)
 
@@ -144,7 +231,10 @@ async def api_send(request: Request):
     if message_text is None:
         return JSONResponse({"error": f"Unknown message: {msg_id}"}, status_code=400)
 
-    # Send to A2A agent
+    # Direct proxy handling for data lookups (instant, no A2A needed)
+    if msg_id in ("roster", "portfolio", "audit"):
+        return await _handle_direct(msg_id, agent_label)
+
     headers = {"Content-Type": "application/json"}
     if A2A_TOKEN: headers["Authorization"] = f"Bearer {A2A_TOKEN}"
 
@@ -169,11 +259,11 @@ async def api_send(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
     task_uuid = uuid.uuid4().hex
-    _pending_tasks[task_uuid] = {
-        "url": agent_url, "a2a_task_id": a2a_task_id,
-        "poll_index": 0, "t_start": time.time(),
-        "headers": headers, "agent_label": agent_label, "target": target,
-    }
+    t_start = time.time()
+    _task_states[task_uuid] = {"state": "submitted", "ts": t_start}
+
+    # Start background polling
+    asyncio.create_task(_background_poll(task_uuid, agent_url, a2a_task_id, headers, t_start))
 
     return JSONResponse({
         "task_uuid": task_uuid,
@@ -183,77 +273,25 @@ async def api_send(request: Request):
 
 
 async def api_poll(request: Request):
-    """Poll the A2A agent once. Returns current state + text if completed."""
+    """Read the latest state of a task. Frontend calls this every 2s."""
     task_uuid = request.query_params.get("task_uuid", "")
-    task = _pending_tasks.get(task_uuid)
-    if not task:
+    state = _task_states.get(task_uuid)
+    if not state:
         return JSONResponse({"state": "unknown", "error": "Task not found"}, status_code=404)
-
-    poll_index = task["poll_index"]
-    if poll_index >= len(DELAYS):
-        # Last poll didn't complete — timeout
-        return JSONResponse({"state": "timeout", "error": "Timeout after 56s", "steps": poll_index})
-
-    delay = DELAYS[poll_index]
-    elapsed_since_start = time.time() - task["t_start"]
-    wait = max(0, delay - elapsed_since_start)
-    if wait > 0:
-        await asyncio.sleep(wait)
-
-    task["poll_index"] += 1
-
-    try:
-        async with httpx.AsyncClient(timeout=30, headers=task["headers"]) as client:
-            poll_resp = await client.post(f"{task['url']}/", json={
-                "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
-                "params": {"id": task["a2a_task_id"]},
-            })
-            if poll_resp.status_code != 200:
-                return JSONResponse({"state": "error", "error": f"HTTP {poll_resp.status_code}", "poll": poll_index, "delay": delay})
-
-            poll_data = poll_resp.json()
-            state = poll_data.get("result", {}).get("status", {}).get("state", "unknown")
-
-            if state == "completed":
-                response_text = ""
-                for a in poll_data.get("result", {}).get("artifacts", []):
-                    for p in a.get("parts", []):
-                        if p.get("kind") == "text": response_text += p.get("text", "")
-                if not response_text:
-                    for m in poll_data.get("result", {}).get("history", []):
-                        if m.get("role") == "agent":
-                            for p in m.get("parts", []):
-                                if p.get("kind") == "text": response_text += p.get("text", "")
-                duration = (time.time() - task["t_start"]) * 1000
-                return JSONResponse({
-                    "state": "completed",
-                    "response": scrub(response_text) if response_text else "(empty)",
-                    "duration_ms": duration,
-                    "poll": poll_index,
-                    "delay": delay,
-                    "total_polls": poll_index,
-                })
-            elif state in ("failed", "canceled"):
-                return JSONResponse({"state": state, "error": f"Task {state}", "poll": poll_index, "delay": delay})
-            else:
-                return JSONResponse({"state": state, "poll": poll_index, "delay": delay})
-    except Exception as e:
-        return JSONResponse({"state": "error", "error": str(e), "poll": poll_index, "delay": delay})
+    return JSONResponse(state)
 
 
 async def api_audit(request: Request):
     try:
         proc = await asyncio.create_subprocess_exec(
             "tail", "-20", "/root/pi-a2a-server/audit.log",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, _ = await proc.communicate()
         lines = []
         for line in stdout.decode().strip().split("\n"):
             if line.strip():
                 try:
-                    entry = json.loads(line)
-                    lines.append(json.loads(mask_ip(mask_token(json.dumps(entry)))))
+                    lines.append(json.loads(mask_ip(mask_token(json.dumps(json.loads(line))))))
                 except json.JSONDecodeError:
                     lines.append({"raw": scrub(line)})
         return JSONResponse({"entries": lines})
@@ -266,14 +304,11 @@ app.add_route("/api/send", api_send, methods=["POST"])
 app.add_route("/api/poll", api_poll, methods=["GET"])
 app.add_route("/api/audit", api_audit, methods=["GET"])
 
-# Serve React build
 import os as _os
 _frontend_dist = _os.path.join(_os.path.dirname(__file__), "frontend", "dist")
 if _os.path.exists(_frontend_dist):
     app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="static")
 
-
 if __name__ == "__main__":
-    print(f"[demo] Live demo proxy on port {DEMO_PORT}")
-    print(f"[demo] Targets: pisti={PISTI_URL}, sisi={SISI_URL}, nori={NORI_URL}")
+    print(f"[demo] Live demo proxy v2 on port {DEMO_PORT}")
     uvicorn.run(app, host="0.0.0.0", port=DEMO_PORT, log_level="info")
