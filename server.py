@@ -57,9 +57,18 @@ from starlette.responses import JSONResponse
 
 HOST = os.environ.get("A2A_HOST", "0.0.0.0")
 PORT = int(os.environ.get("A2A_PORT", "8002"))
-AGENT_URL = os.environ.get("A2A_URL", f"http://localhost:{PORT}")
-AGENT_NAME = os.environ.get("A2A_NAME", "Pi A2A Agent")
+AGENT_URL = os.environ.get("A2A_URL", f"http://187.124.171.89:{PORT}")
+AGENT_NAME = os.environ.get("A2A_NAME", "Pisti — Pi Coding Agent")
 A2A_TOKEN = os.environ.get("A2A_TOKEN", "")
+
+
+@dataclass
+class ModelConfig:
+    """Configuration for a single model in a fallback chain."""
+    model: str          # e.g. "openrouter/deepseek/deepseek-v4-pro"
+    system_prompt: str  # system prompt for this model
+    no_tools: bool = True  # whether to disable builtin tools
+
 
 # Model for A2A tasks — use cheap model to save tokens
 A2A_MODEL = os.environ.get("A2A_MODEL", "google/gemma-3-12b-it")
@@ -75,14 +84,43 @@ A2A_CAPABLE_SYSTEM_PROMPT = os.environ.get(
     "You have full tools (read, bash, write, edit). Solve problems thoroughly."
 )
 
-# Complexity detection — keywords that trigger the capable model
+# ── Fallback model chains ─────────────────────────────────────────────
+# When a model fails with a credit/rater/balance error (402/429/503),
+# PiRpcClient automatically restarts with the next in the chain.
+# Format: comma-separated "provider/model_id" entries.
+# Example: "alibaba-plan/deepseek-v4-pro,alibaba-plan/qwen3.7-plus"
+
+# Fallback chain for the CHEAP tier (A2A_MODEL)
+A2A_CHEAP_FALLBACKS = os.environ.get(
+    "A2A_CHEAP_FALLBACKS", ""
+)  # e.g. "alibaba-plan/qwen3.6-flash"
+
+# Fallback chain for the CAPABLE tier (A2A_CAPABLE_MODEL)
+A2A_CAPABLE_FALLBACKS = os.environ.get(
+    "A2A_CAPABLE_FALLBACKS", ""
+)  # e.g. "alibaba-plan/deepseek-v4-pro,alibaba-plan/qwen3.7-max"
+
+# System prompts for fallback models (shared, overridable per-model with A2A_FALLBACK_PROMPT_<sanitized>)
+A2A_FALLBACK_SYSTEM_PROMPT = os.environ.get(
+    "A2A_FALLBACK_SYSTEM_PROMPT",
+    "You are Pisti, a pi coding agent. Answer helpfully and concisely."
+)
+
+# ── Credit / rate-limit error detection ──
+# Response text patterns that indicate a credit or quota failure.
+# When these appear, the model is skipped and the next fallback is tried.
+CREDIT_ERROR_PATTERNS = [
+    "insufficient_quota", "out of credit", "quota exceeded",
+    "402", "payment required", "rate limit", "429",
+    "billing", "balance", "top up", "upgrade your plan",
+    "api key is not valid", "unauthorized",
+]
 COMPLEX_KEYWORDS = [
     "deploy", "fix", "debug", "create", "build", "analyze", "review",
     "refactor", "implement", "write", "edit", "docker", "restart",
     "configure", "migrate", "investigate", "error", "broken", "down",
-    "failed", "crash", "security", "optimize", "refactor", "audit",
-    "backup", "restore", "install", "update", "upgrade", "nginx",
-    "portfolio", "roster", "cluster", "list all", "read ", "show the",
+    "failed", "crash", "security", "optimize", "refactor",
+    "backup", "restore", "install", "update", "upgrade",
     "ssl", "tls", "domain", "dns",
 ]
 
@@ -96,14 +134,15 @@ AGENT_SKILL_KEYWORDS = [
         "taskmind, bedtime, colosseum, system, bash, read, write, file, "
         "website, container, build, restart, analyze, implement, debug, fix, "
         "create, configure, migrate, security, optimize, audit, backup, "
-        "restore, install, update, upgrade, certificate, ssl, tls, domain, dns"
+        "restore, install, update, upgrade, certificate, ssl, tls, domain, dns, "
+        "cluster, agent, version, skill, peer, mesh, list, roster, status, "
+        "audit log, project, portfolio, what are, show the, tell me"
     ).split(",")
 ]
 
 TRUSTED_IPS = {
-    # Add your peer agent IPs here:
-    # "PEER_IP_1",  # Peer agent 1
-    # "PEER_IP_2",  # Peer agent 2
+    "72.61.87.200",  # Sisi
+    "72.61.81.237",  # Nori
     "127.0.0.1",     # localhost
 }
 
@@ -682,13 +721,34 @@ CIRCUIT_BREAKER_THRESHOLD = 3  # consecutive failures before opening
 CIRCUIT_BREAKER_COOLDOWN = 60  # seconds before trying again
 
 class PiRpcClient:
+    """
+    A pi RPC client with built-in fallback chain support.
+
+    When send_prompt() fails with a credit/rater/balance error, it
+    automatically stops the current process and restarts with the next
+    model in fallback_models. Models are consumed in order until one
+    succeeds or all are exhausted.
+
+    Circuit breaker: after CIRCUIT_BREAKER_THRESHOLD non-credit failures,
+    the client blocks all requests for CIRCUIT_BREAKER_COOLDOWN seconds.
+    Credit-fallback switches reset the breaker.
+    """
+
     def __init__(self, pi_bin: str = "pi", model: str = A2A_MODEL,
                  system_prompt: str = A2A_SYSTEM_PROMPT,
-                 no_tools: bool = True):
+                 no_tools: bool = True,
+                 fallback_models: list[ModelConfig] | None = None):
         self.pi_bin = pi_bin
+        # Primary model config
+        self._primary = ModelConfig(model=model, system_prompt=system_prompt, no_tools=no_tools)
+        self._fallbacks = fallback_models or []
+        # Current active config — changes during fallback
         self.model = model
         self.system_prompt = system_prompt
         self.no_tools = no_tools
+        self._fallback_index: int = -1  # -1 = primary, 0..N = fallback index
+        self._fallback_used: list[str] = []  # for audit logging
+
         self.process: asyncio.subprocess.Process | None = None
         self._response_event = asyncio.Event()
         self._accumulated_text: str = ""
@@ -696,6 +756,47 @@ class PiRpcClient:
         # Circuit breaker state
         self._consecutive_failures = 0
         self._circuit_open_until: float = 0.0
+
+    # ── Model switching ──
+
+    def _current_model_display(self) -> str:
+        """Human-readable current model label for logging."""
+        if self._fallback_used:
+            chain = " → ".join(self._fallback_used)
+            return f"{chain} → {self.model}"
+        return self.model
+
+    def _apply_config(self, cfg: ModelConfig, index: int):
+        """Switch the active model to a new config."""
+        self.model = cfg.model
+        self.system_prompt = cfg.system_prompt
+        self.no_tools = cfg.no_tools
+        self._fallback_index = index
+        if index >= 0 and self.model not in self._fallback_used:
+            self._fallback_used.append(self.model)
+
+    async def _restart_with_model(self, cfg: ModelConfig, index: int):
+        """Stop current process and restart with a new model config."""
+        await self.stop()
+        self._apply_config(cfg, index)
+        await self.start()
+
+    def _is_credit_error(self, text: str) -> bool:
+        """Detect if a response indicates a credit/quota/rater error."""
+        text_lower = text.lower()
+        for pattern in CREDIT_ERROR_PATTERNS:
+            if pattern in text_lower:
+                return True
+        return False
+
+    def _try_next_fallback(self) -> ModelConfig | None:
+        """Return the next fallback config, or None if exhausted."""
+        next_idx = self._fallback_index + 1
+        if next_idx < len(self._fallbacks):
+            return self._fallbacks[next_idx]
+        return None
+
+    # ── Lifecycle ──
 
     async def start(self):
         args = [
@@ -724,6 +825,7 @@ class PiRpcClient:
                     await self.process.wait()
             except ProcessLookupError:
                 pass
+            self.process = None
 
     async def _read_stderr(self):
         if not self.process or not self.process.stderr:
@@ -770,12 +872,31 @@ class PiRpcClient:
                     read_task = asyncio.create_task(self._read_response())
                     self._send_cmd({"type": "prompt", "message": message})
                     try:
-                        await asyncio.wait_for(self._response_event.wait(), timeout=120)
+                        await asyncio.wait_for(self._response_event.wait(), timeout=180)
                     except asyncio.TimeoutError:
                         read_task.cancel()
-                        raise asyncio.TimeoutError(f"Pi did not respond in 120s")
+                        raise asyncio.TimeoutError(f"Pi did not respond in 180s")
                     await read_task
                     result = self._accumulated_text
+
+                # Check for credit/rater errors → auto-fallback
+                if self._is_credit_error(result):
+                    next_cfg = self._try_next_fallback()
+                    if next_cfg:
+                        print(f"[client] CREDIT/QUOTA error on {self.model} — "
+                              f"switching to fallback {next_cfg.model}")
+                        self._fallback_used.append(self.model)
+                        await self._restart_with_model(next_cfg, self._fallback_index + 1)
+                        # Reset circuit breaker — this was a credit issue, not a bug
+                        self._consecutive_failures = 0
+                        # Retry the prompt with the new model (full retries allowed)
+                        return await self.send_prompt(message, max_retries=max_retries)
+                    else:
+                        # No more fallbacks — return the credit error as-is
+                        print(f"[client] CREDIT/QUOTA error on {self.model} — no fallbacks left")
+                        self._fallback_used.append(self.model)
+                        return result
+
                 # Success — reset circuit breaker
                 self._consecutive_failures = 0
                 return result
@@ -786,11 +907,54 @@ class PiRpcClient:
                 if attempt < max_retries:
                     await asyncio.sleep(1.5 * (attempt + 1))  # backoff: 1.5s, 3s
 
-        # All retries exhausted — open circuit breaker
+        # All retries exhausted — try fallbacks before circuit breaker
+        next_cfg = self._try_next_fallback()
+        if next_cfg:
+            print(f"[client] Model {self.model} failed {max_retries+1} times — "
+                  f"switching to fallback {next_cfg.model}")
+            self._fallback_used.append(self.model)
+            await self._restart_with_model(next_cfg, self._fallback_index + 1)
+            self._consecutive_failures = 0
+            return await self.send_prompt(message, max_retries=max_retries)
+
+        # All retries + all fallbacks exhausted — open circuit breaker
         self._circuit_open_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
         print(f"[circuit] OPEN — {self._consecutive_failures} consecutive failures")
-        return f"[error] All {max_retries+1} attempts failed. Last error: {last_error}. " \
-               f"Circuit breaker open for {CIRCUIT_BREAKER_COOLDOWN}s."
+        return f"[error] All {max_retries+1} attempts + {len(self._fallback_used)} fallbacks exhausted. " \
+               f"Last error: {last_error}. Circuit breaker open for {CIRCUIT_BREAKER_COOLDOWN}s."
+
+    async def send_abort(self):
+        async with self._lock:
+            self._send_cmd({"type": "abort"})
+            self._response_event.set()
+
+    async def _read_response(self) -> None:
+        if not self.process or not self.process.stdout:
+            return
+        while True:
+            try:
+                line = await self.process.stdout.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            try:
+                event = json.loads(line.decode().rstrip())
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "message_update":
+                delta_event = event.get("assistantMessageEvent", {})
+                if delta_event.get("type") == "text_delta":
+                    self._accumulated_text += delta_event.get("delta", "")
+            elif event.get("type") == "agent_end":
+                self._response_event.set()
+                break
+
+    def fallback_log(self) -> str:
+        """Human-readable fallback chain description for audit."""
+        if not self._fallback_used:
+            return self.model
+        return " → ".join(self._fallback_used)
 
     async def send_abort(self):
         async with self._lock:
@@ -862,9 +1026,9 @@ class PiWorker(Worker[dict]):
     def _pick_client(self, text: str) -> PiRpcClient:
         """Choose cheap or capable client based on task complexity."""
         if self._is_complex(text) and self.capable_client is not None:
-            print(f"[worker] ⚡ Routing to CAPABLE model ({A2A_CAPABLE_MODEL})")
+            print(f"[worker] ⚡ CAPABLE tier: {self.capable_client._current_model_display()}")
             return self.capable_client
-        print(f"[worker] 💤 Using cheap model ({A2A_MODEL})")
+        print(f"[worker] 💤 CHEAP tier: {self.cheap_client._current_model_display()}")
         return self.cheap_client
 
     async def run_task(self, params: TaskSendParams) -> None:
@@ -1001,9 +1165,14 @@ class PiWorker(Worker[dict]):
 
         try:
             client = self._pick_client(user_prompt)
-            print(f"[worker] Task {task_id[:8]} locally... prompt: {user_prompt[:100]}...")
+            tier = "capable" if client is self.capable_client else "cheap"
+            model_before = client._current_model_display()
+            print(f"[worker] Task {task_id[:8]} [{tier}] {model_before}")
             response_text = await client.send_prompt(full_prompt)
             duration = (time.time() - t_start) * 1000
+            model_used = client._current_model_display()
+            if model_used != model_before:
+                print(f"[worker] Task {task_id[:8]} fallback chain: {model_used}")
             print(f"[worker] Task {task_id[:8]} done ({len(response_text)} chars, {duration:.0f}ms)")
 
             response_msg = Message(
@@ -1030,7 +1199,10 @@ class PiWorker(Worker[dict]):
 
             await audit.log({
                 "event": "task_completed", "task_id": task_id,
-                "routed_to": "pisti (local)", "duration_ms": duration,
+                "routed_to": "pisti (local)",
+                "tier": tier,
+                "model_chain": model_used,
+                "duration_ms": duration,
                 "response_length": len(response_text),
             })
 
@@ -1134,9 +1306,43 @@ def create_app() -> FastA2A:
 
     storage: Storage[dict] = InMemoryStorage[dict]()
     broker = InMemoryBroker()
-    cheap_client = PiRpcClient(model=A2A_MODEL, system_prompt=A2A_SYSTEM_PROMPT, no_tools=True)
-    capable_client = PiRpcClient(model=A2A_CAPABLE_MODEL, system_prompt=A2A_CAPABLE_SYSTEM_PROMPT, no_tools=False)
+
+    # ── Parse fallback chains from env vars ──
+    def _parse_fallback_chain(env_val: str, default_system_prompt: str) -> list[ModelConfig]:
+        """Parse comma-separated model list into ModelConfig objects."""
+        if not env_val or not env_val.strip():
+            return []
+        chain = []
+        for entry in env_val.split(","):
+            model_id = entry.strip()
+            if not model_id:
+                continue
+            # Check for per-model system prompt override: A2A_FALLBACK_PROMPT_<sanitized>
+            sanitized = model_id.replace("/", "_").replace("-", "_").replace(".", "_").upper()
+            prompt = os.environ.get(f"A2A_FALLBACK_PROMPT_{sanitized}", default_system_prompt)
+            chain.append(ModelConfig(model=model_id, system_prompt=prompt, no_tools=True))
+        return chain
+
+    cheap_fallbacks = _parse_fallback_chain(A2A_CHEAP_FALLBACKS, A2A_FALLBACK_SYSTEM_PROMPT)
+    capable_fallbacks = _parse_fallback_chain(A2A_CAPABLE_FALLBACKS, A2A_FALLBACK_SYSTEM_PROMPT)
+
+    cheap_client = PiRpcClient(
+        model=A2A_MODEL, system_prompt=A2A_SYSTEM_PROMPT, no_tools=True,
+        fallback_models=cheap_fallbacks,
+    )
+    capable_client = PiRpcClient(
+        model=A2A_CAPABLE_MODEL, system_prompt=A2A_CAPABLE_SYSTEM_PROMPT, no_tools=False,
+        fallback_models=capable_fallbacks,
+    )
     router = TaskRouter(registry=registry)
+
+    # Log fallback chains at startup
+    if cheap_fallbacks:
+        print(f"[server] Cheap fallback chain: {A2A_MODEL} → "
+              f"{' → '.join(c.model for c in cheap_fallbacks)}")
+    if capable_fallbacks:
+        print(f"[server] Capable fallback chain: {A2A_CAPABLE_MODEL} → "
+              f"{' → '.join(c.model for c in capable_fallbacks)}")
 
     app = FastA2A(
         storage=storage,

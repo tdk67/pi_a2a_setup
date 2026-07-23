@@ -24,7 +24,7 @@ Production-grade agent-to-agent communication mesh built on **pi coding agent** 
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Why Two Pi Instances? (Dual-Model Pool)
+### Why Two Pi Instances? (Dual-Model Pool with Fallback)
 
 A single pi process is locked to one model at startup. Instead of restarting the process to switch models (slow, loses state), the server runs **two processes in parallel**:
 
@@ -34,6 +34,8 @@ A single pi process is locked to one model at startup. Instead of restarting the
 | **Capable** | deepseek-v4-pro (or similar) | Full (read/bash/write/edit) | Varies | Code generation, deployment, debugging, real work |
 
 **Automatic switching**: The server detects task complexity before dispatching. Simple pings never touch the expensive model. Complex tasks automatically route to the capable one. Both processes are always warm — no cold-start delay.
+
+**Credit protection (NEW)**: Each tier has a configurable **fallback chain**. When the primary model returns a credit/quota error, the server auto-restarts with the next model — transparent to callers. No more "out of credit" dead ends.
 
 **If you don't need dual-model**: Set `A2A_CAPABLE_MODEL=$A2A_MODEL` in `.env` and the server will only start one process.
 
@@ -376,6 +378,84 @@ The complexity detector checks (in order):
 
 Override by setting `A2A_MODEL=A2A_CAPABLE_MODEL` in `.env` to always use the capable model.
 
-## License
+## Fallback Chains (Credit Protection)
 
-MIT
+When a model runs out of credit or gets rate-limited (HTTP 402/429/503), the server **automatically switches to the next model** in the fallback chain — no downtime, no error returned to the caller.
+
+### How It Works
+
+```
+OpenRouter returns 402 "insufficient_quota"
+  → PiRpcClient detects credit error in response text
+  → Stops current pi process
+  → Starts pi --mode rpc with next fallback model
+  → Re-sends prompt
+  → Audit log records: "model_chain": "deepseek-v4-pro → alibaba-plan/deepseek-v4-pro"
+```
+
+Both the **cheap** and **capable** tiers have independent fallback chains:
+
+```bash
+# .env
+
+# Cheap tier fallback: Gemma → Alibaba Qwen 3.6 Flash
+A2A_CHEAP_FALLBACKS=alibaba-plan/qwen3.6-flash
+
+# Capable tier fallback: DS V4 Pro → Alibaba DS V4 Pro → Alibaba Qwen 3.7 Max
+A2A_CAPABLE_FALLBACKS=alibaba-plan/deepseek-v4-pro,alibaba-plan/qwen3.7-max
+```
+
+### Setting Up Alibaba Fallback
+
+You need an Alibaba Model Studio Coding Plan subscription (or the shared mesh key):
+
+1. Install the provider: `pi install npm:pi-alibaba-models`
+2. Log in via pi: `/login` → Plans → Alibaba Model Studio Coding Plan → paste your `sk-sp-...` token
+3. The login is stored in `~/.pi/agent/auth.json` — the A2A server reads it from there
+4. Add the fallback chains to your `.env` (see `server.env.example`)
+5. Restart: `systemctl restart pi-a2a-server`
+
+**Available Alibaba Plan models** (free within subscription):
+
+| Model | ID for fallback | Best for |
+|-------|-----------------|----------|
+| DeepSeek V4 Pro | `alibaba-plan/deepseek-v4-pro` | Drop-in DS replacement |
+| Qwen 3.7 Max | `alibaba-plan/qwen3.7-max` | Heavy coding/reasoning |
+| Qwen 3.7 Plus | `alibaba-plan/qwen3.7-plus` | General purpose |
+| Qwen 3.6 Flash | `alibaba-plan/qwen3.6-flash` | Fast/cheap fallback |
+| Qwen 3.8 Max Preview | `alibaba-plan/qwen3.8-max-preview` | Cutting-edge (experimental) |
+| GLM-5.2 | `alibaba-plan/glm-5.2` | Alternative reasoning |
+
+### Credit Error Detection
+
+The server detects credit/rater errors by scanning the model response for these patterns:
+`insufficient_quota`, `out of credit`, `402`, `payment required`, `rate limit`, `429`, `billing`, `balance`, `top up`, `upgrade your plan`
+
+Non-credit failures (timeouts, model crashes) also trigger fallback after exhausting retries.
+
+### Audit Log Changes
+
+Each task now logs `model_chain` and `tier`:
+
+```json
+{
+  "event": "task_completed",
+  "tier": "capable",
+  "model_chain": "deepseek/deepseek-v4-pro → alibaba-plan/qwen3.7-max",
+  "duration_ms": 8234.5,
+  "response_length": 512
+}
+```
+
+### Debugging Fallback
+
+```bash
+# Watch fallback in real time
+journalctl -u pi-a2a-server -f | grep -E "CREDIT|fallback"
+
+# Startup log shows active chains
+journalctl -u pi-a2a-server | grep "fallback chain"
+# Output:
+# [server] Cheap fallback chain: google/gemma-3-12b-it → alibaba-plan/qwen3.6-flash
+# [server] Capable fallback chain: deepseek/deepseek-v4-pro → alibaba-plan/deepseek-v4-pro → alibaba-plan/qwen3.7-max
+```
