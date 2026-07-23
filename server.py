@@ -1,5 +1,5 @@
 """
-Pi A2A Server — pi coding agent exposed via A2A protocol.
+Pisti A2A Server — pi coding agent exposed via A2A protocol.
 
 Security layers:
   L1: Firewall — port 8002 whitelisted to trusted IPs only
@@ -9,11 +9,11 @@ Security layers:
   L5: Audit logging — every request logged to JSONL file
 
 Features:
-- Peer registry with auto-discovery
+- Peer registry with auto-discovery (Sisi, Nori, and future agents)
 - Task router — keyword-based delegation to the right agent
 - Periodic agent card refresh
 
-URL: http://YOUR_IP:PORT
+URL: http://187.124.171.89:8002
 """
 
 from __future__ import annotations
@@ -66,12 +66,12 @@ A2A_MODEL = os.environ.get("A2A_MODEL", "google/gemma-3-12b-it")
 A2A_CAPABLE_MODEL = os.environ.get("A2A_CAPABLE_MODEL", "deepseek/deepseek-v4-pro")
 A2A_SYSTEM_PROMPT = os.environ.get(
     "A2A_SYSTEM_PROMPT",
-    "You are a pi coding agent in the A2A agent mesh. "
+    "You are Pisti, a pi coding agent in a 3-agent mesh. "
     "Answer concisely. For simple status/handshake messages, respond in 1-2 sentences."
 )
 A2A_CAPABLE_SYSTEM_PROMPT = os.environ.get(
     "A2A_CAPABLE_SYSTEM_PROMPT",
-    "You are a pi coding agent with full system access. "
+    "You are Pisti, a pi coding agent managing a VPS with Docker, nginx, and multiple websites. "
     "You have full tools (read, bash, write, edit). Solve problems thoroughly."
 )
 
@@ -82,8 +82,22 @@ COMPLEX_KEYWORDS = [
     "configure", "migrate", "investigate", "error", "broken", "down",
     "failed", "crash", "security", "optimize", "refactor", "audit",
     "backup", "restore", "install", "update", "upgrade", "nginx",
-    # Add domain-specific keywords for your services:
+    "portfolio", "roster", "cluster", "list all", "read ", "show the",
     "ssl", "tls", "domain", "dns",
+]
+
+# Off-topic guard: keywords this agent is allowed to answer.
+# Messages NOT matching any keyword AND not a coordination message
+# (ping/hello/status/handshake) get a polite refusal instead of an LLM answer.
+AGENT_SKILL_KEYWORDS = [
+    s.strip() for s in os.environ.get(
+        "A2A_SKILL_KEYWORDS",
+        "code, edit, refactor, review, deploy, docker, nginx, portfolio, "
+        "taskmind, bedtime, colosseum, system, bash, read, write, file, "
+        "website, container, build, restart, analyze, implement, debug, fix, "
+        "create, configure, migrate, security, optimize, audit, backup, "
+        "restore, install, update, upgrade, certificate, ssl, tls, domain, dns"
+    ).split(",")
 ]
 
 TRUSTED_IPS = {
@@ -120,7 +134,7 @@ def server_fingerprint() -> dict:
     """Return deterministic, verifiable server state."""
     return {
         "agent": AGENT_NAME,
-        "version": "1.0.0",
+        "version": "3.0.0",
         "url": AGENT_URL,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "pid": os.getpid(),
@@ -470,7 +484,7 @@ class PeerRegistry:
 class CallerTrackingMiddleware(BaseHTTPMiddleware):
     """Auto-discovers A2A callers by probing their IP for agent cards."""
 
-    def __init__(self, app, registry: PeerRegistry, our_ip: str = "127.0.0.1"):  # Override with your server IP
+    def __init__(self, app, registry: PeerRegistry, our_ip: str = "187.124.171.89"):
         super().__init__(app)
         self.registry = registry
         self.our_ip = our_ip
@@ -508,10 +522,15 @@ class CallerTrackingMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 ROUTE_KEYWORDS: dict[str, str] = {
-    # Customize keyword → agent mapping for your mesh:
-    # "keyword": "agent-name",
-    # "docker": "devops-agent",
-    # "supabase": "database-agent",
+    "supabase": "sisi",  "database": "sisi", "db": "sisi",
+    "sql": "sisi",       "table": "sisi",    "query": "sisi",
+    "storage": "sisi",   "browse": "sisi",   "scrape": "sisi",
+    "n8n": "nori",       "workflow": "nori", "automation": "nori",
+    "webhook": "nori",
+    "portfolio": "pisti", "taskmind": "pisti", "bedtime": "pisti",
+    "deploy": "pisti",    "docker": "pisti",   "nginx": "pisti",
+    "code": "pisti",      "edit": "pisti",     "refactor": "pisti",
+    "review": "pisti",
 }
 
 
@@ -609,6 +628,7 @@ class TaskRouter:
                 task_id = result.get("result", {}).get("id")
 
                 if task_id:
+                    # Relaxed exponential backoff: 4,4,8,8,16,16 = max 56s
                     delays = [4, 4, 8, 8, 16, 16]
                     for delay in delays:
                         await asyncio.sleep(delay)
@@ -806,9 +826,9 @@ class PiRpcClient:
 
 # Fast responses for simple messages — skip pi entirely, save tokens
 SIMPLE_RESPONSES = {
-    "ping": "🟢 Pong! Pi A2A Agent — online and healthy. All 5 security layers active.",
-    "status": "🟢 Pi A2A Agent — server running. Check /cluster for peers.",
-    "handshake": "🤝 Handshake confirmed! Pi A2A Agent here. Connected to mesh.",
+    "ping": "🟢 Pong! Pisti v3.0.0 — online and healthy. All 5 security layers active.",
+    "status": "🟢 Pisti v3.0.0 — A2A server running on port 8002. 2 peers online (Sisi, Nori).",
+    "handshake": "🤝 Handshake confirmed! Pisti v3.0.0 here. Connected to mesh with Sisi and Nori.",
 }
 
 @dataclass
@@ -934,6 +954,35 @@ class PiWorker(Worker[dict]):
             print(f"[worker] Fast-path response ({len(fast_response)} chars, {duration:.0f}ms)")
             return
 
+        # ---- Off-topic guard rail: refuse questions outside agent skills ----
+        refusal = self._check_relevance(user_prompt)
+        if refusal:
+            duration = (time.time() - t_start) * 1000
+            response_msg = Message(
+                role="agent",
+                parts=[TextPart(kind="text", text=refusal)],
+                kind="message", message_id=str(uuid.uuid4()),
+                context_id=context_id, task_id=task_id,
+            )
+            artifact = Artifact(
+                artifact_id=str(uuid.uuid4()),
+                name="relevance-refusal",
+                description="Off-topic question politely refused",
+                parts=[TextPart(kind="text", text=refusal)],
+            )
+            await self.storage.update_task(
+                task_id, state="completed",
+                new_messages=[response_msg], new_artifacts=[artifact],
+            )
+            await audit.log({
+                "event": "task_completed", "task_id": task_id,
+                "routed_to": "pisti (local, refused)",
+                "duration_ms": duration,
+                "response_length": len(refusal),
+            })
+            print(f"[worker] Relevance refusal: {user_prompt[:80]}...")
+            return
+
         # ---- Full path: use pi for complex messages ----
         context = await self.storage.load_context(context_id) or {}
         conversation_history = context.get("messages", [])
@@ -1035,10 +1084,33 @@ class PiWorker(Worker[dict]):
             handshake_words = {"ping", "hello", "hi", "hey", "handshake", "test",
                                "status", "you there?", "are you there", "who are you"}
             if text_lower in handshake_words:
-                return f"👋 Hello from Pi A2A Agent! Online and ready. Mesh: check /cluster for peers."
+                return f"👋 Hello from Pisti v3.0.0! Online and ready. Mesh: Sisi + Nori connected."
             if "ping" in text_lower and len(text) <= 50:
-                return f"🟢 Pong! Agent here. {text[:50]}"
+                return f"🟢 Pong! Pisti here. {text[:50]}"
         return None
+
+    @staticmethod
+    def _check_relevance(text: str) -> str | None:
+        """Check if a message is within this agent's domain. Returns refusal text or None."""
+        text_lower = text.strip().lower()
+        # Always allow coordination messages
+        coord_words = {"ping", "hello", "hi", "hey", "status", "handshake",
+                       "who are you", "what are you", "version", "help"}
+        if text_lower in coord_words or len(text) <= 15:
+            return None
+        # Check if any skill keyword matches
+        for kw in AGENT_SKILL_KEYWORDS:
+            if kw.strip() and kw.strip() in text_lower:
+                return None
+        # No match — refuse politely
+        skills_preview = ", ".join(AGENT_SKILL_KEYWORDS[:8])
+        return (
+            f"⚠️ I don't handle that topic. My domains are: {skills_preview}...\n\n"
+            f"Try routing to a different agent in the mesh:"
+            f"  • Agent B (Database) — supabase, browsing, file operations\n"
+            f"  • Agent C (Automation) — n8n workflows, webhooks, telegram\n"
+            f"  • Agent A (Coordinator) — code, docker, deployments, websites"
+        )
 
     @staticmethod
     def _extract_text_from_message(msg: Message) -> str:
@@ -1073,11 +1145,12 @@ def create_app() -> FastA2A:
         url=AGENT_URL,
         version="3.0.0",
         description=(
-            "A pi coding agent in the A2A agent mesh. "
-            "Hardened with 5-layer security (firewall, auth, rate limit, guard rails, audit). "
-            "Configure agent description via env vars."
+            "Pisti is a coding agent powered by pi. "
+            "Manages portfolio at taskmind-ai.com and bedtime-stories.cloud. "
+            "Part of a 3-agent mesh with Sisi (Supabase) and Nori (n8n). "
+            "Hardened with 5-layer security."
         ),
-        provider={"organization": "A2A Mesh", "url": "https://github.com/tdk67/pi_a2a_setup"},
+        provider={"organization": "Taskmind AI", "url": "https://taskmind-ai.com"},
         skills=[
             Skill(
                 id="code-generation", name="Code Generation & Editing",
@@ -1094,10 +1167,10 @@ def create_app() -> FastA2A:
                 input_modes=["application/json"], output_modes=["application/json"],
             ),
             Skill(
-                id="custom-task", name="Custom Task Processing",
-                description="Handle domain-specific tasks for this agent.",
-                tags=["custom", "automation"],
-                examples=["Process a custom task"],
+                id="portfolio-management", name="Portfolio & Site Management",
+                description="Manage taskmind-ai.com and bedtime-stories.cloud.",
+                tags=["web", "portfolio", "deployment"],
+                examples=["Add a new project to the portfolio"],
                 input_modes=["application/json"], output_modes=["application/json"],
             ),
             Skill(
@@ -1109,9 +1182,9 @@ def create_app() -> FastA2A:
             ),
             Skill(
                 id="peer-routing", name="Agent Mesh Routing",
-                description="Route tasks to peer agents in the mesh.",
+                description="Route tasks to Sisi (Supabase) or Nori (n8n).",
                 tags=["routing", "coordinator", "mesh"],
-                examples=["route_to: agent-name — Delegate a task"],
+                examples=["route_to: sisi — Check Supabase tables"],
                 input_modes=["application/json"], output_modes=["application/json"],
             ),
         ],
@@ -1166,7 +1239,7 @@ def create_app() -> FastA2A:
         return JSONResponse({
             "pong": True,
             "agent": AGENT_NAME,
-            "version": "1.0.0",
+            "version": "3.0.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -1201,7 +1274,7 @@ def create_app() -> FastA2A:
 
         async with app.task_manager:
             async with worker.run():
-                print(f"[server] A2A agent ready at {AGENT_URL}")
+                print(f"[server] Pisti v3.0.0 ready at {AGENT_URL}")
                 print(f"[server] 5-layer security active")
 
                 async def refresh_peers():

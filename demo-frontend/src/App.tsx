@@ -2,7 +2,19 @@ import { useState, useEffect, useCallback } from 'react';
 import type { DemoState, ExchangeStep } from './types';
 import { DEMO_MESSAGES } from './types';
 import { fetchAgents, sendDemoMessage } from './api';
-import { Activity, Server, Zap, Shield, Terminal, Loader2, AlertTriangle, CheckCircle2, Clock, ArrowRight, RefreshCw } from 'lucide-react';
+import { Activity, Server, Zap, Shield, Terminal, Loader2, AlertTriangle, CheckCircle2, Clock, ArrowRight, RefreshCw, Radio } from 'lucide-react';
+
+const AGENT_TARGETS = [
+  { id: 'pisti', label: 'Pisti', subtitle: 'Coordinator', color: 'emerald' },
+  { id: 'sisi', label: 'Sisi', subtitle: 'Database', color: 'blue' },
+  { id: 'nori', label: 'Nori', subtitle: 'Automation', color: 'purple' },
+];
+
+const colorMap: Record<string, { bg: string; text: string; border: string; glow: string }> = {
+  emerald: { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/30', glow: 'bg-emerald-400' },
+  blue: { bg: 'bg-blue-500/10', text: 'text-blue-400', border: 'border-blue-500/30', glow: 'bg-blue-400' },
+  purple: { bg: 'bg-purple-500/10', text: 'text-purple-400', border: 'border-purple-500/30', glow: 'bg-purple-400' },
+};
 
 export default function App() {
   const [state, setState] = useState<DemoState>({
@@ -11,8 +23,8 @@ export default function App() {
     exchange: [],
     error: null,
   });
-
   const [agentError, setAgentError] = useState<string | null>(null);
+  const [target, setTarget] = useState('pisti');
 
   const loadAgents = useCallback(async () => {
     try {
@@ -34,20 +46,21 @@ export default function App() {
 
   const runDemo = useCallback(async (msg: typeof DEMO_MESSAGES[0]) => {
     if (state.running) return;
+    const targetAgent = AGENT_TARGETS.find(a => a.id === target)!;
+    
     setState(s => ({ ...s, running: msg.id, error: null, exchange: [] }));
 
     const startTime = new Date().toLocaleTimeString();
-    addStep({ type: 'send', time: startTime, text: `→ Sending "${msg.label}" to agent mesh...` });
+    addStep({ type: 'send', time: startTime, text: `→ Sending "${msg.label}" to ${targetAgent.label} (${targetAgent.subtitle})...` });
 
     try {
-      const res = await sendDemoMessage(msg.id);
+      const res = await sendDemoMessage(msg.id, target);
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error(err.error || err.detail || `HTTP ${res.status}`);
       }
       const data = await res.json();
 
-      // Show poll steps
       if (data.steps) {
         for (const step of data.steps) {
           const t = new Date().toLocaleTimeString();
@@ -56,21 +69,20 @@ export default function App() {
         }
       }
 
-      // Show response
       const endTime = new Date().toLocaleTimeString();
       const duration = data.duration_ms ? `${(data.duration_ms / 1000).toFixed(1)}s` : '?';
-      addStep({ type: 'response', time: endTime, text: `← Response (${duration}):\n${data.response || '(empty)'}` });
+      const routedVia = data.routed_via ? ` [routed via ${data.routed_via}]` : '';
+      addStep({ type: 'response', time: endTime, text: `← ${targetAgent.label}${routedVia} (${duration}):\n${data.response || '(empty)'}` });
     } catch (e: any) {
       const t = new Date().toLocaleTimeString();
-      addStep({ type: 'error', time: t, text: `✗ Error: ${e.message}` });
+      addStep({ type: 'error', time: t, text: `✗ Error from ${targetAgent.label}: ${e.message}` });
     } finally {
       setState(s => ({ ...s, running: null }));
     }
-  }, [state.running, addStep]);
+  }, [state.running, addStep, target]);
 
   return (
     <div className="min-h-screen bg-zinc-950">
-      {/* Header */}
       <header className="border-b border-zinc-800 bg-zinc-900/50 backdrop-blur sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -122,24 +134,53 @@ export default function App() {
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-4">
-              {state.agents.map(agent => (
-                <div key={agent.id} className={`bg-zinc-900 border rounded-xl p-5 transition-all ${agent.status === 'online' ? 'border-emerald-500/30' : 'border-red-500/30'}`}>
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="font-semibold text-white">{agent.name}</h3>
-                    <span className={`flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full ${agent.status === 'online' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${agent.status === 'online' ? 'bg-emerald-400 animate-pulse-glow' : 'bg-red-400'}`} />
-                      {agent.status}
-                    </span>
+              {state.agents.map(agent => {
+                const c = AGENT_TARGETS.find(a => a.label === agent.name);
+                const col = colorMap[c?.color || 'emerald'];
+                return (
+                  <div key={agent.id} className={`bg-zinc-900 border rounded-xl p-5 transition-all ${agent.status === 'online' ? col.border : 'border-red-500/30'}`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="font-semibold text-white">{agent.name}</h3>
+                      <span className={`flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full ${agent.status === 'online' ? `${col.bg} ${col.text}` : 'bg-red-500/10 text-red-400'}`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${agent.status === 'online' ? `${col.glow} animate-pulse-glow` : 'bg-red-400'}`} />
+                        {agent.status}
+                      </span>
+                    </div>
+                    <div className="space-y-1 text-sm text-zinc-400">
+                      <div className="flex justify-between"><span>Version</span><span className="text-zinc-300 font-mono">{agent.version}</span></div>
+                      <div className="flex justify-between"><span>Skills</span><span className="text-zinc-300">{agent.skills}</span></div>
+                      <div className="flex justify-between"><span>Address</span><span className="text-zinc-500 font-mono text-xs">{agent.masked_ip}</span></div>
+                    </div>
                   </div>
-                  <div className="space-y-1 text-sm text-zinc-400">
-                    <div className="flex justify-between"><span>Version</span><span className="text-zinc-300 font-mono">{agent.version}</span></div>
-                    <div className="flex justify-between"><span>Skills</span><span className="text-zinc-300">{agent.skills}</span></div>
-                    <div className="flex justify-between"><span>Address</span><span className="text-zinc-500 font-mono text-xs">{agent.masked_ip}</span></div>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
+        </section>
+
+        {/* Target selector */}
+        <section>
+          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+            <Radio className="w-4 h-4" /> Select Target Agent
+          </h2>
+          <div className="flex gap-3">
+            {AGENT_TARGETS.map(a => {
+              const col = colorMap[a.color];
+              const active = target === a.id;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => setTarget(a.id)}
+                  disabled={state.running !== null}
+                  className={`flex-1 rounded-xl p-4 text-left border transition-all ${active ? `${col.border} ${col.bg}` : 'border-zinc-800 bg-zinc-900 hover:border-zinc-600'} disabled:opacity-50`}
+                >
+                  <div className={`font-semibold text-sm ${active ? col.text : 'text-zinc-300'}`}>{a.label}</div>
+                  <div className="text-xs text-zinc-500 mt-0.5">{a.subtitle}</div>
+                  {active && <div className={`mt-2 text-xs ${col.text}`}>● Selected — messages go here</div>}
+                </button>
+              );
+            })}
+          </div>
         </section>
 
         {/* Demo Messages */}
@@ -147,7 +188,7 @@ export default function App() {
           <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4 flex items-center gap-2">
             <Terminal className="w-4 h-4" /> Pre-Approved Messages
           </h2>
-          <div className="grid grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
             {DEMO_MESSAGES.map(msg => (
               <button
                 key={msg.id}
@@ -178,7 +219,7 @@ export default function App() {
               <div className="flex items-center justify-center h-40 text-zinc-600 text-sm">
                 <div className="text-center">
                   <ArrowRight className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                  <p>Click a message above to see live agent communication</p>
+                  <p>Select a target agent above, then click a message to see live communication</p>
                 </div>
               </div>
             ) : (
@@ -200,7 +241,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* Footer */}
         <footer className="text-center text-xs text-zinc-600 pt-4 border-t border-zinc-800">
           <p>Pi A2A Agent Mesh · <a href="https://github.com/tdk67/pi_a2a_setup" className="text-zinc-500 hover:text-zinc-300 underline">github.com/tdk67/pi_a2a_setup</a></p>
           <p className="mt-1">All tokens and IPs are masked. Messages are pre-approved. Real agent responses only.</p>

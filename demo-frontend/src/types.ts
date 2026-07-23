@@ -64,4 +64,11 @@ export const DEMO_MESSAGES: DemoMessage[] = [
     description: 'Show masked audit log entries',
     message: 'Show the last 8 entries from /root/pi-a2a-server/audit.log. Mask the IPs. Reply concisely.',
   },
+  {
+    id: 'offtopic',
+    label: 'Off-Topic Test',
+    emoji: '🚫',
+    description: 'Ask about sky color — should be refused by guard rail',
+    message: "What's the color of the sky?",
+  },
 ];

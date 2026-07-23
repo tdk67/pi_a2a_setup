@@ -59,6 +59,7 @@ MESSAGE_WHITELIST: dict[str, str] = {
     "roster": "List all agents in the cluster with their versions and skills. Reply concisely.",
     "portfolio": "Read /root/taskmind-portfolio/data/projects.json and list the 3 most recent items by date with their titles only. Reply concisely.",
     "audit": "Show the last 8 entries from /root/pi-a2a-server/audit.log. Mask the IPs. Reply concisely.",
+    "offtopic": "What's the color of the sky?",
     # "edit" is built dynamically below
 }
 
@@ -203,6 +204,24 @@ async def api_send(request: Request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     msg_id = body.get("id", "")
+    target = body.get("target", "pisti")
+
+    # Select target agent URL
+    target_urls = {
+        "pisti": PISTI_URL,
+        "sisi": SISI_URL,
+        "nori": NORI_URL,
+    }
+    target_labels = {
+        "pisti": "Pisti (Coordinator)",
+        "sisi": "Sisi (Database)",
+        "nori": "Nori (Automation)",
+    }
+    agent_url = target_urls.get(target, PISTI_URL)
+    agent_label = target_labels.get(target, target)
+
+    if not agent_url:
+        return JSONResponse({"error": f"Agent '{target}' is not configured"}, status_code=400)
 
     # Handle dynamic "edit" message
     if msg_id == "edit":
@@ -220,7 +239,9 @@ async def api_send(request: Request):
     else:
         return JSONResponse({"error": f"Unknown message ID: {msg_id}. Allowed: {list(MESSAGE_WHITELIST.keys())}"}, status_code=400)
 
-    result = await a2a_send_and_poll(PISTI_URL, message_text)
+    result = await a2a_send_and_poll(agent_url, message_text)
+    result["agent"] = target
+    result["agent_label"] = agent_label
     return JSONResponse(result)
 
 
