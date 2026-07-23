@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi A2A Live Demo Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/live-demo
+EnvironmentFile=/root/live-demo/.env
+ExecStart=/usr/bin/python3 /root/live-demo/proxy.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
