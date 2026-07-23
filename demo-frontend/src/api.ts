@@ -12,6 +12,10 @@ export async function sendDemoMessage(messageId: string, target: string): Promis
   });
 }
 
+export async function pollTask(taskUuid: string): Promise<Response> {
+  return fetch(`${API}/poll?task_uuid=${encodeURIComponent(taskUuid)}`);
+}
+
 export async function fetchAuditLog(): Promise<Response> {
   return fetch(`${API}/audit`);
 }

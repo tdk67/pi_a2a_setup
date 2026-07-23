@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { DemoState, ExchangeStep } from './types';
 import { DEMO_MESSAGES } from './types';
-import { fetchAgents, sendDemoMessage } from './api';
+import { fetchAgents, sendDemoMessage, pollTask } from './api';
 import { Activity, Server, Zap, Shield, Terminal, Loader2, AlertTriangle, CheckCircle2, Clock, ArrowRight, RefreshCw, Radio } from 'lucide-react';
 
 const AGENT_TARGETS = [
@@ -25,6 +25,7 @@ export default function App() {
   });
   const [agentError, setAgentError] = useState<string | null>(null);
   const [target, setTarget] = useState('pisti');
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadAgents = useCallback(async () => {
     try {
@@ -47,39 +48,66 @@ export default function App() {
   const runDemo = useCallback(async (msg: typeof DEMO_MESSAGES[0]) => {
     if (state.running) return;
     const targetAgent = AGENT_TARGETS.find(a => a.id === target)!;
-    
     setState(s => ({ ...s, running: msg.id, error: null, exchange: [] }));
 
     const startTime = new Date().toLocaleTimeString();
     addStep({ type: 'send', time: startTime, text: `→ Sending "${msg.label}" to ${targetAgent.label} (${targetAgent.subtitle})...` });
 
     try {
+      // Step 1: Send the message — get task_uuid back immediately
       const res = await sendDemoMessage(msg.id, target);
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error(err.error || err.detail || `HTTP ${res.status}`);
       }
-      const data = await res.json();
+      const { task_uuid, agent_label } = await res.json();
 
-      if (data.steps) {
-        for (const step of data.steps) {
-          const t = new Date().toLocaleTimeString();
-          addStep({ type: 'poll', time: t, text: `  ⏳ Poll ${step.poll}: ${step.state} (${step.delay}s)` });
-          await new Promise(r => setTimeout(r, 300));
-        }
-      }
+      addStep({ type: 'poll', time: new Date().toLocaleTimeString(), text: `  ⏳ Task queued (${task_uuid.slice(0, 8)}). Polling ${agent_label}...` });
 
-      const endTime = new Date().toLocaleTimeString();
-      const duration = data.duration_ms ? `${(data.duration_ms / 1000).toFixed(1)}s` : '?';
-      const routedVia = data.routed_via ? ` [routed via ${data.routed_via}]` : '';
-      addStep({ type: 'response', time: endTime, text: `← ${targetAgent.label}${routedVia} (${duration}):\n${data.response || '(empty)'}` });
+      // Step 2: Poll live every 2s until completed
+      await new Promise<void>((resolve, reject) => {
+        let pollCount = 0;
+        pollRef.current = setInterval(async () => {
+          pollCount++;
+          try {
+            const pollRes = await pollTask(task_uuid);
+            if (!pollRes.ok) {
+              clearInterval(pollRef.current!);
+              reject(new Error(`Poll HTTP ${pollRes.status}`));
+              return;
+            }
+            const data = await pollRes.json();
+            const t = new Date().toLocaleTimeString();
+
+            if (data.state === 'completed') {
+              clearInterval(pollRef.current!);
+              const duration = data.duration_ms ? `${(data.duration_ms / 1000).toFixed(1)}s` : '?';
+              addStep({ type: 'response', time: t, text: `← ${agent_label} (${duration}, ${data.total_polls} polls):\n${data.response || '(empty)'}` });
+              resolve();
+            } else if (data.state === 'failed' || data.state === 'canceled' || data.state === 'timeout') {
+              clearInterval(pollRef.current!);
+              addStep({ type: 'error', time: t, text: `✗ ${agent_label}: Task ${data.state} — ${data.error || 'no details'}` });
+              resolve();
+            } else {
+              addStep({ type: 'poll', time: t, text: `  ⏳ Poll #${data.poll}: ${data.state} (${data.delay}s delay)` });
+            }
+          } catch (e: any) {
+            clearInterval(pollRef.current!);
+            reject(e);
+          }
+        }, 2000);
+      });
     } catch (e: any) {
       const t = new Date().toLocaleTimeString();
-      addStep({ type: 'error', time: t, text: `✗ Error from ${targetAgent.label}: ${e.message}` });
+      addStep({ type: 'error', time: t, text: `✗ Error: ${e.message}` });
     } finally {
       setState(s => ({ ...s, running: null }));
+      pollRef.current = null;
     }
   }, [state.running, addStep, target]);
+
+  // Cleanup poll on unmount
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   return (
     <div className="min-h-screen bg-zinc-950">
@@ -209,17 +237,23 @@ export default function App() {
           </div>
         </section>
 
-        {/* Live Exchange */}
+        {/* Live Exchange — auto-scrolls to bottom */}
         <section>
           <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4 flex items-center gap-2">
             <Activity className="w-4 h-4" /> Live Exchange
+            {state.running && (
+              <span className="text-amber-400 text-xs flex items-center gap-1 ml-auto">
+                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" /> Polling live...
+              </span>
+            )}
           </h2>
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 min-h-[200px] max-h-[400px] overflow-y-auto">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 min-h-[200px] max-h-[400px] overflow-y-auto" id="exchange-log">
             {state.exchange.length === 0 ? (
               <div className="flex items-center justify-center h-40 text-zinc-600 text-sm">
                 <div className="text-center">
                   <ArrowRight className="w-8 h-8 mx-auto mb-2 opacity-50" />
                   <p>Select a target agent above, then click a message to see live communication</p>
+                  <p className="text-xs mt-1 text-zinc-700">Polls appear in real-time every 2 seconds</p>
                 </div>
               </div>
             ) : (
