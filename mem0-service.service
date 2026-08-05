@@ -1,0 +1,16 @@
+[Unit]
+Description=mem0 Memory Service for Pi Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.pi/agent
+ExecStart=/usr/bin/python3 /root/.pi/agent/mem0_service.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/mem0-service.log
+StandardError=append:/var/log/mem0-service.log
+
+[Install]
+WantedBy=multi-user.target
